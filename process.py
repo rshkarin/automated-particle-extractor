@@ -9,6 +9,7 @@ import scipy.ndimage as ndi
 import skimage.measure as measure
 import skimage.util as util
 import skimage.exposure as exp
+import skimage.restoration as rest
 import skimage.filters as filters
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -66,6 +67,35 @@ def object_counter(stack_binary_data):
 
     return objects_stats, labeled_stack
 
+def renyi_entropy_thresholding(im, alpha=3):
+  hist = exp.histogram(im)
+  hist_float = [float(i) for i in hist[0]]
+  pdf = hist_float / np.sum(hist_float)
+  cumsum_pdf = np.cumsum(pdf)
+
+  s, e = 0, 255
+  scalar = 1. / (1. - alpha)
+  eps = np.spacing(1)
+
+  rr = e - s
+  h1 = np.zeros((rr, 1))
+  h2 = np.zeros((rr, 1))
+
+  for ii in range(1, rr):
+      iidash = ii + s
+
+      temp1 = np.power(pdf[1:iidash] / cumsum_pdf[iidash], scalar)
+      h1[ii] = np.log(np.sum(temp1) + eps)
+
+      temp2 = np.power(pdf[iidash+1:255] / (1. - cumsum_pdf[iidash]), scalar)
+      h2[ii] = np.log(np.sum(temp2) + eps)
+
+  T = h1 + h2
+  T = -T * scalar
+  location = T.argmax(axis=0)
+
+  return location
+
 def open_data(sample_dir, place_type, reco_folder='reconstructed'):
     input_data = None
 
@@ -87,6 +117,7 @@ def process_batch(samples, input_dir, place_type, verbose=True, output_folder='A
         t = Timer()
         print 'Data processing - Opening and filtering...'
         input_data = open_data(os.path.join(input_dir, sample), place_type)
+        output_dir = os.path.join(input_dir, sample, output_folder)
         filtered_input_data = ndi.filters.median_filter(input_data, size=(2,2,2))
         filtered_input_data = ndi.filters.gaussian_filter(input_data, sigma=1)
         t.elapsed('Data processing - Opening and filtering...')
@@ -98,7 +129,7 @@ def process_batch(samples, input_dir, place_type, verbose=True, output_folder='A
 
         for idx,data_slice in enumerate(input_data):
             if idx % 100 == 0 or idx == (n_slices - 1):
-                print 'Slice {0}/{1}'.format(idx, input_data.shape[0])
+                print 'Slice {0}/{1}'.format(idx, input_data.shape[0])d
 
             #global histogram stretching
             p2, p98 = np.percentile(data_slice, (2, 98))
@@ -112,15 +143,17 @@ def process_batch(samples, input_dir, place_type, verbose=True, output_folder='A
         print 'Data processing - Noise filtering...'
         thresholded_data = util.img_as_ubyte(thresholded_data)
         thresholded_data = ndi.morphology.binary_opening(thresholded_data, structure=np.ones((2,2,2)), iterations=1)
-        thresholded_data = ndi.filters.median_filter(thresholded_data, size=(3,3,3))
+        thresholded_data = ndi.filters.median_filter(thresholded_data, size=(5,5,5))
         t.elapsed('Data processing - Noise filtering...')
+
+        #write_as_raw(thresholded_data, sample, output_dir, prefix='TEST3')
+        #break
 
         #object counting
         objects_stats, labeled_data = object_counter(thresholded_data)
 
         t = Timer()
         print 'Data saving - Stats and data saving...'
-        output_dir = os.path.join(input_dir, sample, output_folder)
 
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
