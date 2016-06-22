@@ -11,6 +11,9 @@ import skimage.util as util
 import skimage.exposure as exp
 import skimage.restoration as rest
 import skimage.filters as filters
+import skimage.feature as feature
+import skimage.color as color
+import skimage.morphology as morphology
 import matplotlib.pyplot as plt
 from PIL import Image
 
@@ -43,11 +46,46 @@ def write_as_raw(data, sample_name, output_dir, prefix=None):
                         else '{0}_{1}_{2}bit_{3}x{4}x{5}.raw'.format(sample_name, prefix, bits, *size)
     data.tofile(os.path.join(output_dir, output_filename))
 
+def write_as_2d_raw(data, sample_name, output_dir, prefix=None):
+    bits = -1
+    if data.dtype == np.int32 or data.dtype == np.float32:
+        bits = 32
+    elif data.dtype == np.uint8 or data.dtype == np.bool:
+        bits = 8
+
+    size = data.shape[::-1]
+    output_filename = '{0}_{1}bit_{2}x{3}.raw'.format(sample_name, bits, *size) if prefix is None \
+                        else '{0}_{1}_{2}bit_{3}x{4}.raw'.format(sample_name, prefix, bits, *size)
+    data.tofile(os.path.join(output_dir, output_filename))
+
 def object_counter(stack_binary_data):
     t = Timer()
     print 'Object counting - Labeling...'
     labeled_stack, num_labels = ndi.measurements.label(stack_binary_data)
     t.elapsed('Object counting - Labeling ({0} labels)...'.format(num_labels))
+
+    objects_stats = pd.DataFrame(columns=_MEASUREMENTS_VALS)
+
+    t = Timer()
+    print 'Object counting - Stats gathering...'
+    for slice_idx in np.arange(labeled_stack.shape[0]):
+        for region in measure.regionprops(labeled_stack[slice_idx]):
+            objects_stats = objects_stats.append({_measure: region[_measure] \
+                                        for _measure in _MEASUREMENTS_VALS}, \
+                                            ignore_index=True)
+    t.elapsed('Object counting - Stats gathering...')
+
+    t = Timer()
+    print 'Object counting - Stats grouping...'
+    objects_stats = objects_stats.groupby('label', as_index=False).sum()
+    t.elapsed('Object counting - Stats grouping...')
+
+    return objects_stats, labeled_stack
+
+def object_counter_by_labels(labeled_stack):
+    t = Timer()
+    print 'Object counting - Labeling...'
+    t.elapsed('Object counting - Labeling...')
 
     objects_stats = pd.DataFrame(columns=_MEASUREMENTS_VALS)
 
@@ -111,43 +149,50 @@ def open_data(sample_dir, place_type, reco_folder='reconstructed'):
 
     return input_data
 
-def process_batch(samples, input_dir, place_type, verbose=True, output_folder='Analysis'):
+def process_batch(samples, input_dir, place_type, verbose=True, output_folder='Analysis_nlm_temp'):
     for sample in samples:
         print '###### Processing of {0}'.format(sample)
         t = Timer()
         print 'Data processing - Opening and filtering...'
         input_data = open_data(os.path.join(input_dir, sample), place_type)
         output_dir = os.path.join(input_dir, sample, output_folder)
+
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
         filtered_input_data = ndi.filters.median_filter(input_data, size=(2,2,2))
         filtered_input_data = ndi.filters.gaussian_filter(input_data, sigma=1)
+        #filtered_input_data = rest.denoise_nl_means(input_data, patch_size=5, patch_distance=7, h=0.16, multichannel=False, fast_mode=False)
         t.elapsed('Data processing - Opening and filtering...')
 
         t = Timer()
         print 'Data processing - Binarizing...'
-        thresholded_data = np.zeros_like(input_data)
+        thresholded_data = np.zeros_like(filtered_input_data)
         n_slices = input_data.shape[0]
 
-        for idx,data_slice in enumerate(input_data):
+        for idx,data_slice in enumerate(filtered_input_data):
             if idx % 100 == 0 or idx == (n_slices - 1):
-                print 'Slice {0}/{1}'.format(idx, input_data.shape[0])d
+                print 'Slice {0}/{1}'.format(idx, n_slices)
 
             #global histogram stretching
-            p2, p98 = np.percentile(data_slice, (2, 98))
-            data_slice = exp.rescale_intensity(data_slice, out_range=(p2, p98))
+            p1, p2 = np.percentile(data_slice, 0.2), np.percentile(data_slice, 99.8)
+            data_slice = exp.rescale_intensity(data_slice, in_range=(p1, p2))
             threshold_value = filters.threshold_otsu(data_slice)
             thresholded_data[idx] = (data_slice > threshold_value)
 
+            thresholded_data[idx] = data_slice
+
         t.elapsed('Data processing - Binarizing...')
+
+        #write_as_raw(thresholded_data, sample, output_dir, prefix='filtered_data_nothresh')
+        #continue
 
         t = Timer()
         print 'Data processing - Noise filtering...'
         thresholded_data = util.img_as_ubyte(thresholded_data)
-        thresholded_data = ndi.morphology.binary_opening(thresholded_data, structure=np.ones((2,2,2)), iterations=1)
-        thresholded_data = ndi.filters.median_filter(thresholded_data, size=(5,5,5))
+        #thresholded_data = ndi.morphology.binary_opening(thresholded_data, structure=np.ones((2,2,2)), iterations=1)
+        #thresholded_data = ndi.filters.median_filter(thresholded_data, size=(5,5,5))
         t.elapsed('Data processing - Noise filtering...')
-
-        #write_as_raw(thresholded_data, sample, output_dir, prefix='TEST3')
-        #break
 
         #object counting
         objects_stats, labeled_data = object_counter(thresholded_data)
@@ -155,16 +200,28 @@ def process_batch(samples, input_dir, place_type, verbose=True, output_folder='A
         t = Timer()
         print 'Data saving - Stats and data saving...'
 
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        print labeled_data.dtype
-        print thresholded_data.dtype
-
+        write_as_raw(input_data, sample, output_dir, prefix='original')
+        write_as_raw(filtered_input_data, sample, output_dir, prefix='filtered_data')
         write_as_raw(labeled_data, sample, output_dir, prefix='labels')
         write_as_raw(thresholded_data, sample, output_dir, prefix='mask')
         objects_stats.to_csv(os.path.join(output_dir, 'particles_stats_{0}.csv'.format(sample)))
+
         t.elapsed('Data saving - Stats and data saving...')
+
+def main2():
+    data_path = "Z:\\tomo\\rshkarin\\SvetaRawData\\{0}\\Analysis_temp"
+    names = ['scan_0008_filtered_data_thresh_8bit_1536x1536x786', 'scan_0010_filtered_data_thresh_8bit_1536x1536x786', 'scan_0005_filtered_data_thresh_8bit_1536x1536x826', 'scan_0007_filtered_data_thresh_8bit_1536x1536x787']
+    sizes = [(768,1536,1536,), (768,1536,1536,), (826,1536,1536,), (787,1536,1536)]
+    samples = ['scan_0008', 'scan_0010', 'scan_0005', 'scan_0007']
+
+    for name, size, sample in zip(names, sizes, samples):
+        dpath = data_path.format(sample)
+        print dpath
+        input_data_path = os.path.join(dpath, name) + '.raw'
+        input_data = np.memmap(input_data_path, shape=size, dtype=np.uint8)
+        input_data = input_data / 255
+        objects_stats, labeled_data = object_counter(input_data)
+        objects_stats.to_csv(os.path.join(dpath, 'particles_stats_{0}.csv'.format(name)))
 
 def main():
     parser = argparse.ArgumentParser()
@@ -181,5 +238,298 @@ def main():
 
     process_batch(args.samples, args.input_dir, args.type, verbose=args.verbose)
 
+def separate_particles():
+    data_path = "Z:\\tomo\\rshkarin\\SvetaRawData\\{0}\\Analysis_temp"
+    #names = ['scan_0010_filtered_data_thresh_8bit_1536x1536x786']
+    names = ['scan_0010_filtered_data_thresh_8bit_1536x1536x1']
+    sizes = [(1536,1536,)]
+    samples = ['scan_0010']
+
+    for name, size, sample in zip(names, sizes, samples):
+        dpath = data_path.format(sample)
+        print dpath
+        input_data_path = os.path.join(dpath, name) + '.raw'
+        input_data = np.memmap(input_data_path, shape=size, dtype=np.uint8)
+
+        #input_data = ndi.morphology.binary_opening(input_data, structure=np.ones((5,5,1)), iterations=1)
+        #write_as_raw(input_data, sample, dpath, prefix='opened_filtered_data_thresh')
+
+        print 'ndimage.interpolation.zoom'
+        zoomed_data = ndi.interpolation.zoom(input_data, 0.5, order=0)
+        markers_zoomed_data = morphology.remove_small_objects(ndi.label(zoomed_data)[0], 15)
+        markers_zoomed_data = ndi.filters.median_filter(markers_zoomed_data, size=(4,4))
+        markers_zoomed_data = markers_zoomed_data > 0
+        markers_zoomed_data = ndi.morphology.binary_fill_holes(markers_zoomed_data, structure=np.ones((3,3)))
+        markers_zoomed_data_labels = ndi.label(markers_zoomed_data)[0]
+        # markers_zoomed_data = markers_zoomed_data > 0
+        # markers_zoomed_data = markers_zoomed_data.astype(np.uint8)
+        # markers_zoomed_data = ndi.morphology.binary_fill_holes(markers_zoomed_data, structure=np.ones((1,3,3)))
+        # #zoomed_data = ndi.filters.median_filter(zoomed_data, size=(1,4,4))
+        # markers_zoomed_data = ndi.label(zoomed_data)[0]
+        # markers_zoomed_data = morphology.remove_small_objects(markers_zoomed_data, 15)
+        # markers_zoomed_data = ndi.filters.median_filter(markers_zoomed_data, size=(1,4,4))
+        write_as_2d_raw(markers_zoomed_data, sample, dpath, prefix='binary_fill_holes_filtered_data_thresh')
+        write_as_2d_raw(markers_zoomed_data_labels, sample, dpath, prefix='labels_binary_fill_holes_filtered_data_thresh')
+
+        print 'distance_transform_edt'
+        distance = ndi.distance_transform_edt(markers_zoomed_data)
+        write_as_2d_raw(distance, sample, dpath, prefix='distance_transform_edt_data_thresh')
+
+        print 'peak_local_max'
+        #local_maxi = feature.peak_local_max(distance, indices=False, footprint=np.ones((3, 3, 3)), labels=zoomed_data)
+        #local_maxi = feature.peak_local_max(distance, indices=False, footprint=np.ones((1, 3, 3)), labels=markers_zoomed_data)
+        local_maxi = feature.peak_local_max(distance, indices=False,  footprint=morphology.disk(3), labels=markers_zoomed_data).astype(np.uint8)
+        write_as_2d_raw(local_maxi, sample, dpath, prefix='peak_local_max_filtered_data_thresh')
+
+        print 'label(local_maxi)[0]'
+        markers = ndi.label(local_maxi)[0]
+
+        print 'morphology.watershed'
+        labels = morphology.watershed(-distance, markers, mask=markers_zoomed_data)
+
+        print 'write_as_raw'
+        write_as_2d_raw(labels, sample, dpath, prefix='separated_particles')
+
+def separate_particles2():
+    data_path = "Z:\\tomo\\rshkarin\\SvetaRawData\\{0}\\Analysis_temp"
+    #names = ['scan_0010_filtered_data_thresh_8bit_1536x1536x786']
+    #names = ['scan_0010_slice509_filtered_data_nothresh_32bit_1536x1536']
+    names = ['scan_0010_filtered_data_nothresh_32bit_768x768x393']
+    #sizes = [(1536,1536,)]
+    #sizes = [(786,1536,1536,)]
+    sizes = [(393,768,768,)]
+    samples = ['scan_0010']
+
+    for name, size, sample in zip(names, sizes, samples):
+        dpath = data_path.format(sample)
+        print dpath
+        input_data_path = os.path.join(dpath, name) + '.raw'
+        input_data = np.memmap(input_data_path, shape=size, dtype=np.float32)
+
+        p1, p2 = np.percentile(input_data, 0.2), np.percentile(input_data, 99.8)
+
+        print 'exp.rescale_intensity'
+        data_slice = exp.rescale_intensity(input_data, in_range=(p1, p2))
+
+        print 'util.img_as_ubyte'
+        data_slice = util.img_as_ubyte(data_slice)
+        #write_as_2d_raw(data_slice, sample, dpath, prefix='intensity_rescaled_slice509')
+        write_as_raw(data_slice, sample, dpath, prefix='intensity_rescaled')
+
+        print 'filters.rank.median'
+        #denoised = filters.rank.median(data_slice, morphology.disk(5))
+        #denoised = ndi.filters.median_filter(data_slice, size=(3,3,3))
+        denoised = filters.gaussian(denoised, 2, mode='nearest')
+
+        #write_as_2d_raw(denoised, sample, dpath, prefix='denoised_intensity_rescaled_slice509')
+        write_as_raw(denoised, sample, dpath, prefix='denoised_intensity_rescaled')
+
+        print 'filters.rank.gradient'
+        #markers = filters.rank.gradient(denoised, morphology.disk(5)) < 25
+
+        markers = np.gradient(denoised) < 25
+
+        write_as_raw(markers, sample, dpath, prefix='gradient_intensity_rescaled')
+
+        markers = ndi.label(markers)[0]
+
+        print 'filters.rank.gradient - 2'
+        #gradient = filters.rank.gradient(denoised, morphology.disk(1))
+        gradient = np.gradient(denoised)
+        #write_as_2d_raw(gradient, sample, dpath, prefix='gradient2_slice509')
+        write_as_raw(gradient, sample, dpath, prefix='gradient2')
+
+        print 'filters.threshold_otsu'
+        masked_data = np.zeros_like(denoised)
+        for i,d_slice in enumerate(denoised):
+            threshold_value = filters.threshold_otsu(d_slice)
+            masked_data[i] = (d_slice > threshold_value)
+
+        print 'morphology.watershed'
+        labels = morphology.watershed(gradient, markers, mask=masked_data)
+
+        # write_as_2d_raw(markers, sample, dpath, prefix='local_grad_slice509')
+        # write_as_2d_raw(labels, sample, dpath, prefix='watershed_slice509')
+        # write_as_2d_raw(masked_data, sample, dpath, prefix='labels_slice509')
+        #
+        write_as_raw(markers, sample, dpath, prefix='local_grad')
+        write_as_raw(labels, sample, dpath, prefix='watershed')
+        write_as_raw(masked_data, sample, dpath, prefix='labels')
+
+def separate_particles2():
+    data_path = "Z:\\tomo\\rshkarin\\SvetaRawData\\{0}\\Analysis_temp"
+    names = ['scan_0010_filtered_data_nothresh_32bit_768x768x393']
+    # names = ['scan_0010_filtered_data_nothresh_32bit_384x384x196']
+    # sizes = [(196,384,384,)]
+    sizes = [(393,768,768,)]
+    samples = ['scan_0010']
+
+    for name, size, sample in zip(names, sizes, samples):
+        dpath = data_path.format(sample)
+        print dpath
+        input_data_path = os.path.join(dpath, name) + '.raw'
+        input_data = np.memmap(input_data_path, shape=size, dtype=np.float32)
+
+        p1, p2 = np.percentile(input_data, 0.2), np.percentile(input_data, 99.8)
+
+        print 'exp.rescale_intensity'
+        data_slice = exp.rescale_intensity(input_data, in_range=(p1, p2))
+
+        print 'util.img_as_ubyte'
+        data_slice = util.img_as_ubyte(data_slice)
+        write_as_raw(data_slice, sample, dpath, prefix='intensity_rescaled')
+
+        print 'filters.gaussian'
+        denoised = ndi.filters.median_filter(data_slice, size=3)
+        write_as_raw(denoised, sample, dpath, prefix='denoised_intensity_rescaled')
+
+        print 'filters.threshold_otsu'
+        masked_data = np.zeros_like(denoised)
+        for i,d_slice in enumerate(denoised):
+            threshold_value = filters.threshold_otsu(d_slice)
+            masked_data[i] = (d_slice > threshold_value)
+
+        # print 'filters.rank.gradient'
+        # gradient_markers = np.zeros_like(denoised)
+        # for i,d_slice in enumerate(denoised):
+        #     gradient_markers[i] = filters.rank.gradient(d_slice, morphology.disk(2)) < 25
+        #
+        # write_as_raw(gradient_markers, sample, dpath, prefix='gradient_markers')
+        # gradient_markers = ndi.label(gradient_markers)[0]
+        #
+        # print 'filters.rank.gradient - 2'
+        # gradient = np.zeros_like(denoised)
+        # for i,d_slice in enumerate(denoised):
+        #     gradient[i] = filters.rank.gradient(d_slice, morphology.disk(2))
+        #
+        # write_as_raw(gradient, sample, dpath, prefix='gradient')
+
+        #################################################################################
+
+        # print 'distance_transform_edt'
+        # distance = ndi.distance_transform_edt(masked_data)
+        # write_as_raw(distance, sample, dpath, prefix='distance_transform_edt')
+        #
+        # print 'peak_local_max'
+        # local_maxi = feature.peak_local_max(distance, indices=False,  footprint=np.ones((30,30,30))).astype(np.uint8)
+        # write_as_raw(local_maxi, sample, dpath, prefix='peak_local_max_filtered_data_thresh')
+        #
+        # print 'label(local_maxi)[0]'
+        # markers = ndi.label(local_maxi)[0]
+        #
+        # print 'morphology.watershed'
+        # labels = morphology.watershed(-distance, markers, mask=masked_data)
+
+        #################################################################################
+
+        markers = ndi.morphology.binary_erosion(masked_data, structure=np.ones((3,3,3)), iterations=6).astype(np.uint8)
+        write_as_raw(markers, sample, dpath, prefix='MARKERS')
+
+        print 'label(local_maxi)[0]'
+        markers = ndi.label(markers)[0]
+
+        print 'filters.rank.gradient - 2'
+        gradient = np.zeros_like(denoised)
+        for i,d_slice in enumerate(denoised):
+            gradient[i] = filters.rank.gradient(d_slice, morphology.disk(3))
+
+        write_as_raw(gradient, sample, dpath, prefix='GRADIENT')
+
+        print 'morphology.watershed'
+        labels = morphology.watershed(gradient, markers, mask=masked_data)
+
+        # print 'morphology.watershed'
+        # labels = morphology.watershed(gradient, gradient_markers, mask=masked_data)
+
+        print 'write_as_raw'
+        write_as_raw(labels, sample, dpath, prefix='separated_particles')
+
+
+        objects_stats, labeled_data = object_counter_by_labels(labels)
+
+        t = Timer()
+        print 'Data saving - Stats and data saving...'
+        objects_stats.to_csv(os.path.join(dpath, 'particles_stats_watershed_{0}.csv'.format(sample)))
+
+def separate_particles3():
+    data_path = "Z:\\tomo\\rshkarin\\SvetaRawData\\{0}\\Analysis_temp"
+    names = ['scan_0012_filtered_data_nothresh_32bit_768x768x393']
+    # names = ['scan_0012_filtered_data_nothresh_32bit_1536x1536x40']
+    #names = ['scan_0012_filtered_data_nothresh_32bit_1536x1536x786']
+    sizes = [(393,768,768)]
+    #sizes = [(30,768,768)]
+    #sizes = [(768,1536,1536)]
+    #sizes = [(40,1536,1536)]
+    samples = ['scan_0012']
+
+    for name, size, sample in zip(names, sizes, samples):
+        dpath = data_path.format(sample)
+        print dpath
+        input_data_path = os.path.join(dpath, name) + '.raw'
+        input_data = np.memmap(input_data_path, shape=size, dtype=np.float32)
+
+        p1, p2 = np.percentile(input_data, 0.2), np.percentile(input_data, 99.8)
+
+        print 'exp.rescale_intensity'
+        data_slice = exp.rescale_intensity(input_data, in_range=(p1, p2), out_range=(.0, 1.))
+        write_as_raw(data_slice, sample, dpath, prefix='intensity_rescaled')
+
+        print 'util.img_as_ubyte'
+        data_slice = util.img_as_ubyte(data_slice)
+        write_as_raw(data_slice, sample, dpath, prefix='img_as_ubyte')
+
+        print 'filters.median_filter'
+        denoised = ndi.filters.median_filter(data_slice, size=2)
+        write_as_raw(denoised, sample, dpath, prefix='denoised_intensity_rescaled')
+
+        print 'filters.threshold_otsu'
+        masked_data = np.zeros_like(denoised)
+        for i,d_slice in enumerate(denoised):
+            threshold_value = filters.threshold_otsu(d_slice)
+            masked_data[i] = (d_slice > threshold_value)
+
+        print 'morphology.binary_closing'
+        masked_data = ndi.morphology.binary_opening(masked_data, structure=np.ones((2,2,2)), iterations=1).astype(np.uint8)
+        #masked_data = ndi.morphology.binary_fill_holes(masked_data, structure=np.ones((5,5,5))).astype(np.uint8)
+        masked_data = morphology.remove_small_holes(masked_data, min_size=500)
+        write_as_raw(masked_data, sample, dpath, prefix='remove_small_holes')
+
+        print 'distance_transform_edt'
+        distance = ndi.distance_transform_edt(masked_data)
+        write_as_raw(distance, sample, dpath, prefix='distance_transform_edt')
+
+        print 'peak_local_max'
+        local_maxi = feature.peak_local_max(distance, indices=False,  footprint=np.ones((8,8,8))).astype(np.uint8)
+        write_as_raw(local_maxi, sample, dpath, prefix='peak_local_max_filtered_data_thresh')
+
+        print 'label(local_maxi)[0]'
+        markers = ndi.label(local_maxi)[0]
+
+        print 'morphology.watershed'
+        labels = morphology.watershed(-distance, markers, mask=masked_data)
+        ########################################################################################
+        #
+        # print 'label(local_maxi)[0]'
+        # markers = ndi.label(masked_data)[0]
+        #
+        # print 'filters.rank.gradient - 2'
+        # gradient = np.zeros_like(denoised)
+        # for i,d_slice in enumerate(denoised):
+        #     gradient[i] = filters.rank.gradient(d_slice, morphology.disk(1))
+        #
+        # write_as_raw(gradient, sample, dpath, prefix='GRADIENT')
+        #
+        # print 'morphology.watershed'
+        # labels = morphology.watershed(gradient, markers, mask=masked_data)
+        #
+        image_label_overlay = color.label2rgb(labels[15], image=exp.rescale_intensity(input_data[15], in_range='image', out_range=(.0, 1.)))
+        plt.imshow(image_label_overlay, interpolation='nearest')
+        plt.show()
+
+
+        print 'write_as_raw'
+        write_as_raw(labels, sample, dpath, prefix='separated_particles')
+
 if __name__ == "__main__":
-    sys.exit(main())
+    #sys.exit(main())
+    separate_particles3()
